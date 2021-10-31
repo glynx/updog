@@ -31,7 +31,9 @@ def parse_arguments():
                              '[Default=.]')
     parser.add_argument('-p', '--port', type=int, default=9090,
                         help='Port to serve [Default=9090]')
-    parser.add_argument('--password', type=str, default='', help='Use a password to access the page. (No username)')
+    parser.add_argument('--password', type=str, default='', help='Require basic authentication with this password to access the page. (no authentication by default)')
+    parser.add_argument('--username', type=str, default='', help='Set the username for basic authentication. (Default=\'\')')
+    parser.add_argument('--allow-download', default=False, help='Allows download of files without authentication.', action='store_const', const=True)
     parser.add_argument('--ssl', action='store_true', help='Use an encrypted connection')
     parser.add_argument('--version', action='version', version='%(prog)s v'+VERSION)
 
@@ -47,13 +49,16 @@ def main():
     args = parse_arguments()
 
     app = Flask(__name__)
+    global auth
     auth = HTTPBasicAuth()
 
     global base_directory
     base_directory = args.directory
 
     # Deal with Favicon requests
+    # Require authentication if password is set to prevent spiders from detecting updog by the favicon
     @app.route('/favicon.ico')
+    @auth.login_required
     def favicon():
         return send_from_directory(os.path.join(app.root_path, 'static'),
                                    'images/favicon.ico', mimetype='image/vnd.microsoft.icon')
@@ -63,10 +68,15 @@ def main():
     ############################################
     @app.route('/', defaults={'path': None})
     @app.route('/<path:path>')
-    @auth.login_required
+    @auth.login_required(optional=args.allow_download)
     def home(path):
         # If there is a path parameter and it is valid
         if path and is_valid_subpath(path, base_directory):
+
+            # Check if authenticated or resource may be accessed without authentication 
+            if args.password != '' and auth.current_user() is False and args.allow_download is False:
+                return auth.auth_error_callback(401)
+
             # Take off the trailing '/'
             path = os.path.normpath(path)
             requested_path = os.path.join(base_directory, path)
@@ -100,24 +110,73 @@ def main():
         else:
             # Root home configuration
             is_subdirectory = False
+            path = ''
             requested_path = base_directory
             back = ''
 
+        # Check if authenticated or no authentication requuired
+        if args.password != '' and auth.current_user() is False:
+                return auth.auth_error_callback(401)
+        
         if os.path.exists(requested_path):
             # Read the files
             try:
                 directory_files = process_files(os.scandir(requested_path), base_directory)
             except PermissionError:
-                abort(403, 'Read Permission Denied: ' + requested_path)
+                abort(403, 'Read Permission Denied: ' + path)
 
             return render_template('home.html', files=directory_files, back=back,
-                                   directory=requested_path, is_subdirectory=is_subdirectory, version=VERSION)
+                                   directory=path, is_subdirectory=is_subdirectory, version=VERSION)
         else:
             return redirect('/')
 
-    #############################
-    # File Upload Functionality #
-    #############################
+
+    ##################################
+    # REST File Upload Functionality #
+    ##################################
+    @app.route('/<path:path>', methods=['POST'])
+    @auth.login_required
+    def rest_upload(path):
+        target_directory = os.path.abspath(os.path.join(base_directory, os.path.dirname(path)))
+        target_file = os.path.basename(path)
+        if not (os.path.isdir(target_directory) and is_valid_subpath(path, base_directory)):
+            abort(404, 'Invalid Path: ' + path)
+        files = request.files.getlist("file")
+        if len(files) > 0 and len(target_file) == 0:
+            # path is targeting a directory
+            # content is multipart/form-data, take the uploaded files 
+            for f in files:
+                target = os.path.join(target_directory, secure_filename(f.filename))    
+                try:
+                    f.save(target)
+                except PermissionError:
+                    abort(403, 'Write Permission Denied: ' + path)
+        elif len(files) > 0 and len(target_file) > 0:
+            # path is targeting a file
+            # content is multipart/form-data, take the first uploaded file
+            target = os.path.join(target_directory, target_file)
+            try:
+                files[0].save(target)
+            except PermissionError:
+                abort(403, 'Write Permission Denied: ' + path)
+        else:
+            # take the raw request body as content 
+            if len(target_file) == 0:
+                # fail if the path is not a file
+                abort(404, 'Invalid Filename: ' + target_file)
+            target = os.path.join(target_directory, target_file)
+            try:
+                with open(target, "wb") as f:
+                    f.write(request.data) 
+            except PermissionError:
+                abort(403, 'Write Permission Denied: ' + path)
+        # do not return anything
+        return ('', 204)
+
+
+    ##################################
+    # Form File Upload Functionality #
+    ##################################
     @app.route('/upload', methods=['POST'])
     @auth.login_required
     def upload():
@@ -139,21 +198,19 @@ def main():
                     return redirect(request.referrer)
 
                 # Assuming all is good, process and save out the file
-                # TODO:
-                # - Add support for overwriting
                 if file:
                     filename = secure_filename(file.filename)
-                    full_path = os.path.join(path, filename)
+                    full_path = os.path.join(base_directory, os.path.normpath(path), filename)
                     try:
                         file.save(full_path)
                     except PermissionError:
-                        abort(403, 'Write Permission Denied: ' + full_path)
+                        abort(403, 'Write Permission Denied: ' + path)
 
             return redirect(request.referrer)
 
     # Password functionality is without username
     users = {
-        '': generate_password_hash(args.password)
+        args.username: generate_password_hash(args.password)
     }
 
     @auth.verify_password
